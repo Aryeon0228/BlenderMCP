@@ -1,0 +1,17 @@
+{
+  "name": "blender-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for controlling Blender 5.0.1 on Windows",
+  "main": "blender_mcp_server.py",
+  "scripts": {
+    "start": "python blender_mcp_server.py"
+  },
+  "keywords": [
+    "mcp",
+    "blender",
+    "3d",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT"
+}
