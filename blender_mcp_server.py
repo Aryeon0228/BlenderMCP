@@ -1,193 +1,312 @@
 #!/usr/bin/env python3
 """
 Blender MCP Server
-A Model Context Protocol server for controlling Blender 5.0.1
+A Model Context Protocol server that connects to Blender via socket communication
 """
 
 import asyncio
-import sys
-import subprocess
-import os
-from typing import Any, Sequence
 import json
+import os
+import socket
+from typing import Any, Sequence
 
 from mcp.server import Server
-from mcp.types import (
-    Tool,
-    TextContent,
-    ImageContent,
-    EmbeddedResource,
-)
-from pydantic import AnyUrl
+from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
 
-
-# Blender executable path - will be configured based on Windows installation
-BLENDER_PATH = os.environ.get("BLENDER_PATH", "C:\\Program Files\\Blender Foundation\\Blender 5.0\\blender.exe")
+# Configuration
+BLENDER_HOST = os.environ.get("BLENDER_HOST", "localhost")
+BLENDER_PORT = int(os.environ.get("BLENDER_PORT", "9876"))
 
 # Initialize MCP server
 server = Server("blender-mcp")
 
+# Global connection
+_blender_connection = None
 
-async def run_blender_script(script: str, background: bool = True) -> dict[str, Any]:
-    """
-    Execute a Python script in Blender.
 
-    Args:
-        script: Python script to execute in Blender
-        background: Run Blender in background mode
+class BlenderConnection:
+    """Manages socket connection to Blender addon"""
 
-    Returns:
-        Dictionary with stdout, stderr, and return code
-    """
-    # Create temporary script file
-    import tempfile
-    import time
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.socket = None
 
-    # Use tempfile to avoid conflicts
-    fd, script_file = tempfile.mkstemp(suffix=".py", text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(script)
-    except:
-        os.close(fd)
-        raise
+    def connect(self):
+        """Establish connection to Blender"""
+        if self.socket:
+            return  # Already connected
 
-    try:
-        # Build command
-        cmd = [BLENDER_PATH]
-        if background:
-            cmd.append("--background")
-        cmd.extend(["--python", script_file])
-
-        # Run Blender synchronously in thread pool to avoid Windows asyncio issues
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=120,  # 2 minute timeout
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            )
-        )
-
-        return {
-            "stdout": result.stdout.decode("utf-8", errors="ignore"),
-            "stderr": result.stderr.decode("utf-8", errors="ignore"),
-            "returncode": result.returncode,
-            "success": result.returncode == 0
-        }
-    finally:
-        # Clean up temp file
         try:
-            if os.path.exists(script_file):
-                os.remove(script_file)
-        except:
-            pass
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(180)  # 3 minute timeout
+            self.socket.connect((self.host, self.port))
+            print(f"Connected to Blender at {self.host}:{self.port}")
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to Blender: {e}. Make sure Blender is running with the MCP addon enabled.")
+
+    def disconnect(self):
+        """Close connection"""
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+
+    def send_command(self, command_type: str, params: dict = None) -> dict:
+        """Send command to Blender and get response"""
+        if not self.socket:
+            self.connect()
+
+        command = {
+            "type": command_type,
+            "params": params or {}
+        }
+
+        try:
+            # Send command
+            command_json = json.dumps(command) + "\n"
+            self.socket.sendall(command_json.encode('utf-8'))
+
+            # Receive response (with chunking support for large responses)
+            buffer = ""
+            while True:
+                chunk = self.socket.recv(4096).decode('utf-8')
+                if not chunk:
+                    raise ConnectionError("Connection closed by Blender")
+
+                buffer += chunk
+
+                # Try to parse complete JSON
+                try:
+                    response = json.loads(buffer)
+                    return response
+                except json.JSONDecodeError:
+                    # Incomplete JSON, continue receiving
+                    continue
+
+        except Exception as e:
+            # Connection error, reset socket
+            self.disconnect()
+            raise ConnectionError(f"Communication error: {e}")
+
+
+def get_connection() -> BlenderConnection:
+    """Get or create Blender connection"""
+    global _blender_connection
+    if not _blender_connection:
+        _blender_connection = BlenderConnection(BLENDER_HOST, BLENDER_PORT)
+    return _blender_connection
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """List available Blender control tools."""
+    """List available Blender control tools"""
     return [
         Tool(
-            name="create_cube",
-            description="Create a cube in the Blender scene",
+            name="get_scene_info",
+            description="Get information about the current Blender scene including all objects, frame range, and render settings",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            }
+        ),
+        Tool(
+            name="get_object_info",
+            description="Get detailed information about a specific object in the scene",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name for the cube object",
-                        "default": "Cube"
+                        "description": "Name of the object to query"
+                    }
+                },
+                "required": ["name"]
+            }
+        ),
+        Tool(
+            name="create_object",
+            description="Create a new 3D object in Blender. Supports: cube, sphere, cylinder, cone, plane, torus",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "Type of object: cube, sphere, cylinder, cone, plane, torus",
+                        "enum": ["cube", "sphere", "cylinder", "cone", "plane", "torus"]
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional name for the object"
                     },
                     "location": {
                         "type": "array",
                         "items": {"type": "number"},
-                        "description": "Location [x, y, z] in 3D space",
+                        "description": "Position [x, y, z]",
                         "default": [0, 0, 0]
                     },
                     "size": {
                         "type": "number",
-                        "description": "Size of the cube",
-                        "default": 2.0
+                        "description": "Size (for cube, plane)"
+                    },
+                    "radius": {
+                        "type": "number",
+                        "description": "Radius (for sphere, cylinder, cone)"
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Depth/height (for cylinder, cone)"
                     }
-                }
+                },
+                "required": ["type"]
             }
         ),
         Tool(
-            name="create_sphere",
-            description="Create a UV sphere in the Blender scene",
+            name="delete_object",
+            description="Delete an object from the scene",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name for the sphere object",
-                        "default": "Sphere"
+                        "description": "Name of the object to delete"
+                    }
+                },
+                "required": ["name"]
+            }
+        ),
+        Tool(
+            name="move_object",
+            description="Move an object to a new location",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the object"
                     },
                     "location": {
                         "type": "array",
                         "items": {"type": "number"},
-                        "description": "Location [x, y, z] in 3D space",
-                        "default": [0, 0, 0]
-                    },
-                    "radius": {
-                        "type": "number",
-                        "description": "Radius of the sphere",
-                        "default": 1.0
-                    },
-                    "subdivisions": {
-                        "type": "integer",
-                        "description": "Number of subdivisions",
-                        "default": 32
+                        "description": "New position [x, y, z]"
                     }
-                }
+                },
+                "required": ["name", "location"]
             }
         ),
         Tool(
-            name="execute_python",
-            description="Execute arbitrary Python code in Blender context",
+            name="scale_object",
+            description="Scale an object",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the object"
+                    },
+                    "scale": {
+                        "description": "Scale factor (number for uniform, or [x,y,z] for non-uniform)",
+                    }
+                },
+                "required": ["name", "scale"]
+            }
+        ),
+        Tool(
+            name="rotate_object",
+            description="Rotate an object (Euler angles in radians)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the object"
+                    },
+                    "rotation": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Rotation [x, y, z] in radians"
+                    }
+                },
+                "required": ["name", "rotation"]
+            }
+        ),
+        Tool(
+            name="execute_blender_code",
+            description="Execute arbitrary Python code in Blender context. Has access to bpy, C (context), D (data). WARNING: This can modify or delete your scene. Save your work first!",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
                         "description": "Python code to execute in Blender"
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": "Run in background mode (no GUI)",
-                        "default": True
                     }
                 },
                 "required": ["code"]
             }
         ),
         Tool(
+            name="get_viewport_screenshot",
+            description="Capture a screenshot of the current viewport",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "width": {
+                        "type": "integer",
+                        "description": "Screenshot width in pixels",
+                        "default": 1920
+                    },
+                    "height": {
+                        "type": "integer",
+                        "description": "Screenshot height in pixels",
+                        "default": 1080
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="set_material",
+            description="Set material properties for an object",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the object"
+                    },
+                    "color": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "RGB or RGBA color values [r, g, b] or [r, g, b, a] (0-1 range)"
+                    }
+                },
+                "required": ["name"]
+            }
+        ),
+        Tool(
             name="render_scene",
-            description="Render the current Blender scene to an image",
+            description="Render the current scene to an image file",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Output file path for the rendered image"
+                        "description": "Output file path (absolute path recommended)"
                     },
                     "resolution_x": {
                         "type": "integer",
-                        "description": "Render resolution width",
+                        "description": "Render width",
                         "default": 1920
                     },
                     "resolution_y": {
                         "type": "integer",
-                        "description": "Render resolution height",
+                        "description": "Render height",
                         "default": 1080
                     },
                     "samples": {
                         "type": "integer",
-                        "description": "Number of render samples",
+                        "description": "Render samples (for Cycles)",
                         "default": 128
                     }
                 },
@@ -208,266 +327,101 @@ async def list_tools() -> list[Tool]:
                 "required": ["filepath"]
             }
         ),
-        Tool(
-            name="get_blender_info",
-            description="Get information about Blender installation and version",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        Tool(
-            name="list_objects",
-            description="List all objects in the current Blender scene",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        Tool(
-            name="delete_object",
-            description="Delete an object from the Blender scene by name",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the object to delete"
-                    }
-                },
-                "required": ["name"]
-            }
-        )
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
-    """Handle tool calls for Blender operations."""
+    """Handle tool calls by sending commands to Blender"""
 
-    if name == "create_cube":
-        cube_name = arguments.get("name", "Cube")
-        location = arguments.get("location", [0, 0, 0])
-        size = arguments.get("size", 2.0)
+    try:
+        conn = get_connection()
 
-        script = f"""
-import bpy
+        # Map MCP tool names to Blender command types
+        command_mapping = {
+            "get_scene_info": "get_scene_info",
+            "get_object_info": "get_object_info",
+            "create_object": "create_object",
+            "delete_object": "delete_object",
+            "move_object": "move_object",
+            "scale_object": "scale_object",
+            "rotate_object": "rotate_object",
+            "execute_blender_code": "execute_code",
+            "get_viewport_screenshot": "get_viewport_screenshot",
+            "set_material": "set_material",
+            "render_scene": "render_scene",
+            "save_blend_file": "save_file",
+        }
 
-# Create cube
-bpy.ops.mesh.primitive_cube_add(size={size}, location=({location[0]}, {location[1]}, {location[2]}))
-cube = bpy.context.active_object
-cube.name = "{cube_name}"
-
-print(f"Created cube '{{cube.name}}' at location {location}")
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
+        command_type = command_mapping.get(name)
+        if not command_type:
             return [TextContent(
                 type="text",
-                text=f"✓ Created cube '{cube_name}' at location {location} with size {size}"
+                text=f"Unknown tool: {name}"
             )]
+
+        # Send command to Blender
+        response = conn.send_command(command_type, arguments)
+
+        # Handle response
+        if response.get("status") == "success":
+            result = response.get("result", {})
+
+            # Special handling for screenshots
+            if name == "get_viewport_screenshot" and "image_base64" in result:
+                import base64
+                image_data = base64.b64decode(result["image_base64"])
+                return [
+                    ImageContent(
+                        type="image",
+                        data=image_data,
+                        mimeType="image/png"
+                    ),
+                    TextContent(
+                        type="text",
+                        text=f"Screenshot captured: {result.get('width')}x{result.get('height')}"
+                    )
+                ]
+
+            # Standard text response
+            if isinstance(result, dict):
+                result_text = json.dumps(result, indent=2)
+            else:
+                result_text = str(result)
+
+            return [TextContent(
+                type="text",
+                text=f"✓ Success:\n{result_text}"
+            )]
+
         else:
+            # Error response
+            error_msg = response.get("message", "Unknown error")
+            traceback_info = response.get("traceback", "")
+
+            error_text = f"✗ Error: {error_msg}"
+            if traceback_info:
+                error_text += f"\n\nTraceback:\n{traceback_info}"
+
             return [TextContent(
                 type="text",
-                text=f"✗ Failed to create cube:\n{result['stderr']}"
+                text=error_text
             )]
 
-    elif name == "create_sphere":
-        sphere_name = arguments.get("name", "Sphere")
-        location = arguments.get("location", [0, 0, 0])
-        radius = arguments.get("radius", 1.0)
-        subdivisions = arguments.get("subdivisions", 32)
-
-        script = f"""
-import bpy
-
-# Create sphere
-bpy.ops.mesh.primitive_uv_sphere_add(
-    radius={radius},
-    location=({location[0]}, {location[1]}, {location[2]}),
-    segments={subdivisions},
-    ring_count={subdivisions//2}
-)
-sphere = bpy.context.active_object
-sphere.name = "{sphere_name}"
-
-print(f"Created sphere '{{sphere.name}}' at location {location}")
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
-            return [TextContent(
-                type="text",
-                text=f"✓ Created sphere '{sphere_name}' at location {location} with radius {radius}"
-            )]
-        else:
-            return [TextContent(
-                type="text",
-                text=f"✗ Failed to create sphere:\n{result['stderr']}"
-            )]
-
-    elif name == "execute_python":
-        code = arguments.get("code", "")
-        background = arguments.get("background", True)
-
-        result = await run_blender_script(code, background=background)
-
+    except ConnectionError as e:
         return [TextContent(
             type="text",
-            text=f"Execution {'succeeded' if result['success'] else 'failed'}:\n\nOutput:\n{result['stdout']}\n\nErrors:\n{result['stderr']}"
+            text=f"✗ Connection Error: {e}\n\nMake sure:\n1. Blender is running\n2. The MCP addon is installed and enabled\n3. The server is started (check the MCP panel in Blender)"
         )]
-
-    elif name == "render_scene":
-        output_path = arguments.get("output_path")
-        resolution_x = arguments.get("resolution_x", 1920)
-        resolution_y = arguments.get("resolution_y", 1080)
-        samples = arguments.get("samples", 128)
-
-        # Convert to absolute path for Windows
-        output_path = os.path.abspath(output_path)
-
-        script = f"""
-import bpy
-
-# Set render settings
-scene = bpy.context.scene
-scene.render.resolution_x = {resolution_x}
-scene.render.resolution_y = {resolution_y}
-scene.render.filepath = r"{output_path}"
-
-# Set cycles render engine if available
-if hasattr(bpy.context.scene, 'cycles'):
-    scene.render.engine = 'CYCLES'
-    scene.cycles.samples = {samples}
-
-# Render
-bpy.ops.render.render(write_still=True)
-print(f"Rendered to: {output_path}")
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
-            return [TextContent(
-                type="text",
-                text=f"✓ Rendered scene to: {output_path}\nResolution: {resolution_x}x{resolution_y}, Samples: {samples}"
-            )]
-        else:
-            return [TextContent(
-                type="text",
-                text=f"✗ Failed to render:\n{result['stderr']}"
-            )]
-
-    elif name == "save_blend_file":
-        filepath = arguments.get("filepath")
-        filepath = os.path.abspath(filepath)
-
-        script = f"""
-import bpy
-
-bpy.ops.wm.save_as_mainfile(filepath=r"{filepath}")
-print(f"Saved to: {filepath}")
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
-            return [TextContent(
-                type="text",
-                text=f"✓ Saved Blender file to: {filepath}"
-            )]
-        else:
-            return [TextContent(
-                type="text",
-                text=f"✗ Failed to save file:\n{result['stderr']}"
-            )]
-
-    elif name == "get_blender_info":
-        script = """
-import bpy
-import sys
-
-info = {
-    'version': bpy.app.version_string,
-    'build_date': bpy.app.build_date.decode('utf-8'),
-    'python_version': sys.version,
-    'executable': bpy.app.binary_path
-}
-
-import json
-print(json.dumps(info, indent=2))
-"""
-        result = await run_blender_script(script)
-
+    except Exception as e:
         return [TextContent(
             type="text",
-            text=f"Blender Information:\n{result['stdout']}"
-        )]
-
-    elif name == "list_objects":
-        script = """
-import bpy
-import json
-
-objects = []
-for obj in bpy.data.objects:
-    objects.append({
-        'name': obj.name,
-        'type': obj.type,
-        'location': list(obj.location)
-    })
-
-print(json.dumps(objects, indent=2))
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
-            return [TextContent(
-                type="text",
-                text=f"Objects in scene:\n{result['stdout']}"
-            )]
-        else:
-            return [TextContent(
-                type="text",
-                text=f"✗ Failed to list objects:\n{result['stderr']}"
-            )]
-
-    elif name == "delete_object":
-        obj_name = arguments.get("name")
-
-        script = f"""
-import bpy
-
-obj = bpy.data.objects.get("{obj_name}")
-if obj:
-    bpy.data.objects.remove(obj, do_unlink=True)
-    print(f"Deleted object: {obj_name}")
-else:
-    print(f"Object not found: {obj_name}")
-    import sys
-    sys.exit(1)
-"""
-        result = await run_blender_script(script)
-
-        if result["success"]:
-            return [TextContent(
-                type="text",
-                text=f"✓ Deleted object: {obj_name}"
-            )]
-        else:
-            return [TextContent(
-                type="text",
-                text=f"✗ Failed to delete object:\n{result['stderr']}"
-            )]
-
-    else:
-        return [TextContent(
-            type="text",
-            text=f"Unknown tool: {name}"
+            text=f"✗ Unexpected error: {e}"
         )]
 
 
 async def main():
-    """Main entry point for the server."""
+    """Main entry point"""
     from mcp.server.stdio import stdio_server
 
     async with stdio_server() as (read_stream, write_stream):
