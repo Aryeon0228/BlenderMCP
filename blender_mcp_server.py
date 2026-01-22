@@ -40,9 +40,17 @@ async def run_blender_script(script: str, background: bool = True) -> dict[str, 
         Dictionary with stdout, stderr, and return code
     """
     # Create temporary script file
-    script_file = "temp_blender_script.py"
-    with open(script_file, "w", encoding="utf-8") as f:
-        f.write(script)
+    import tempfile
+    import time
+
+    # Use tempfile to avoid conflicts
+    fd, script_file = tempfile.mkstemp(suffix=".py", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(script)
+    except:
+        os.close(fd)
+        raise
 
     try:
         # Build command
@@ -51,25 +59,32 @@ async def run_blender_script(script: str, background: bool = True) -> dict[str, 
             cmd.append("--background")
         cmd.extend(["--python", script_file])
 
-        # Run Blender
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Run Blender synchronously in thread pool to avoid Windows asyncio issues
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,  # 2 minute timeout
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            )
         )
 
-        stdout, stderr = await process.communicate()
-
         return {
-            "stdout": stdout.decode("utf-8", errors="ignore"),
-            "stderr": stderr.decode("utf-8", errors="ignore"),
-            "returncode": process.returncode,
-            "success": process.returncode == 0
+            "stdout": result.stdout.decode("utf-8", errors="ignore"),
+            "stderr": result.stderr.decode("utf-8", errors="ignore"),
+            "returncode": result.returncode,
+            "success": result.returncode == 0
         }
     finally:
         # Clean up temp file
-        if os.path.exists(script_file):
-            os.remove(script_file)
+        try:
+            if os.path.exists(script_file):
+                os.remove(script_file)
+        except:
+            pass
 
 
 @server.list_tools()
